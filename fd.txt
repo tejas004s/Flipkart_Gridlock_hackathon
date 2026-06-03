@@ -1,0 +1,210 @@
+================================================================================
+  FLIPKART TRAFFIC DEMAND PREDICTION — SOLUTION DESCRIPTION
+================================================================================
+
+COMPETITION OVERVIEW
+--------------------
+Task      : Predict traffic demand (0–1) for road segments identified by geohash
+            and 15-minute timestamp slots
+Train set : 77,299 rows | Days 48–49 | 11 columns (including target: demand)
+Test set  : 41,778 rows | Day 49 only | 10 columns (no target)
+Metric    : R² Score
+
+
+================================================================================
+  TOOLS & LIBRARIES
+================================================================================
+
+Language       : Python 3.10+
+
+Core Libraries
+--------------
+pandas         - Data loading, merging, groupby aggregations, target encoding
+numpy          - Vectorised math, array clipping, trigonometric transformations
+scikit-learn   - ExtraTreesRegressor, r2_score, MAE, RMSE metrics
+
+Development
+-----------
+Jupyter Notebook  - Interactive exploration and final pipeline
+matplotlib        - EDA visualisations (demand distribution, hourly patterns)
+seaborn           - Correlation and distribution plots
+scipy.stats       - Pearson correlation for day-over-day lag analysis
+
+
+================================================================================
+  FEATURE ENGINEERING  (25 features total)
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+1. TIME FEATURES  (7 features)
+────────────────────────────────────────────────────────────────────────────────
+
+The raw timestamp field (e.g. "8:15") was parsed and transformed into multiple
+representations to capture intra-day demand patterns.
+
+  hour          — Integer hour extracted from timestamp string (0–23)
+  minute        — Integer minute extracted from timestamp string (0, 15, 30, 45)
+  time_of_day   — Minutes since midnight (hour × 60 + minute), range 0–1425
+  sin_time      — sin(2π × time_of_day / 1440)  ┐ Cyclical encoding so that
+  cos_time      — cos(2π × time_of_day / 1440)  ┘ 23:45 and 0:00 are adjacent
+  is_peak       — Binary flag: 1 if hour ∈ {7,8,9,17,18,19} (rush hours), else 0
+  is_night      — Binary flag: 1 if hour ∈ {22,23,0,1,2,3,4,5}, else 0
+
+
+────────────────────────────────────────────────────────────────────────────────
+2. CATEGORICAL ENCODING  (4 features)
+────────────────────────────────────────────────────────────────────────────────
+
+  RoadType_enc      — Ordinal map: Residential=0, Commercial=1, Highway=2,
+                      Unknown/missing=3
+  LargeVehicles_enc — Binary: 1 if "Allowed", 0 otherwise (NaN → 0)
+  Landmarks_enc     — Binary: 1 if "Yes", 0 otherwise (NaN → 0)
+  Weather_enc       — Ordinal map: Sunny=0, Rainy=1, Cloudy=2, Snowy=3,
+                      Unknown/missing=4
+
+  Missing values in RoadType and Weather were filled with "Unknown" before
+  mapping. Temperature NaNs were filled with the global training set median.
+
+
+────────────────────────────────────────────────────────────────────────────────
+3. TARGET ENCODING / STATISTICAL AGGREGATIONS  (6 features)
+────────────────────────────────────────────────────────────────────────────────
+
+These features encode historical demand statistics computed from the full
+training set and joined back onto each row.
+
+  gh_mean      — Mean demand grouped by geohash
+                 (captures the baseline demand level of a road segment)
+
+  gh_std       — Standard deviation of demand grouped by geohash
+                 (captures demand volatility of a road segment)
+
+  ts_mean      — Mean demand grouped by timestamp slot
+                 (captures the typical demand level at a given time of day)
+
+  ts_std       — Standard deviation of demand grouped by timestamp slot
+
+  rt_mean      — Mean demand grouped by RoadType
+                 (Highway > Commercial > Residential in general)
+
+  lanes_mean   — Mean demand grouped by NumberofLanes
+
+
+────────────────────────────────────────────────────────────────────────────────
+4. GEOHASH × TIMESTAMP INTERACTION  (1 feature)  ★ Strongest predictor
+────────────────────────────────────────────────────────────────────────────────
+
+  gh_ts_mean   — Mean demand grouped by (geohash, timestamp) pair
+
+  This is the single most powerful feature. Since each (geohash, timestamp)
+  combination appears at most once per day in the training data, this lookup
+  effectively memorises the historical demand for every road segment at every
+  time slot. For rows without a match, the value falls back to gh_mean.
+
+  This feature alone drives Train R² to 1.00 when used with a tree ensemble
+  that can perform exact lookups.
+
+
+────────────────────────────────────────────────────────────────────────────────
+5. LAG FEATURE  (1 feature)  ★ Key generalisation signal for test set
+────────────────────────────────────────────────────────────────────────────────
+
+  lag1         — Demand from Day 48 for the same (geohash, timestamp) pair
+
+  Rationale: The test set is entirely Day 49. Day 48 demand for the same
+  road segment at the same time slot is the strongest available signal for
+  predicting Day 49 demand (Pearson r = 0.79, implied R² ≈ 0.63 from lag
+  alone). Coverage: 88.9% of test rows have an exact Day-48 match.
+  Missing values (11.1%) fall back to gh_ts_mean, then gh_mean.
+
+
+────────────────────────────────────────────────────────────────────────────────
+6. INTERACTION / PRODUCT FEATURES  (4 features)
+────────────────────────────────────────────────────────────────────────────────
+
+Non-linear cross-terms that help tree models discover multiplicative patterns.
+
+  lag1_x_ts    — lag1 × ts_mean
+                 (scales the lag signal by the typical time-slot demand level)
+
+  gh_x_ts      — gh_mean × ts_mean
+                 (joint baseline for location × time)
+
+  lag1_x_gh    — lag1 × gh_mean
+                 (scales lag by the overall segment activity level)
+
+  lanes_x_ts   — NumberofLanes × ts_mean
+                 (road capacity interaction with time-of-day demand)
+
+
+================================================================================
+  MODEL
+================================================================================
+
+Algorithm   : ExtraTreesRegressor (sklearn.ensemble)
+              (Extremely Randomised Trees — variant of Random Forest where both
+               the feature split point AND the feature itself are chosen randomly,
+               yielding lower variance and faster training than standard RF)
+
+Hyperparameters
+---------------
+  n_estimators     = 500   (number of trees; more trees → lower variance)
+  min_samples_leaf = 1     (allow leaves with a single sample for precise lookup)
+  max_features     = sqrt  (random subspace at each split for diversity)
+  bootstrap        = False (ExtraTrees uses the full dataset per tree by default)
+  random_state     = 42
+  n_jobs           = -1    (parallelise across all CPU cores)
+
+Why ExtraTrees?
+---------------
+  - Can perfectly memorise the (geohash × timestamp) lookup when leaf size = 1
+  - Faster than GBM for large datasets (single-pass, no boosting iterations)
+  - The ensemble over 500 trees smooths out noise for unseen test combinations
+
+
+================================================================================
+  VALIDATION STRATEGY
+================================================================================
+
+Temporal split (mirrors the actual test scenario):
+  - Train on Day 48  (69,427 rows)
+  - Validate on Day 49 (7,872 rows that appear in train)
+
+  CV R² (Day 49 held-out) : ~0.66
+  Full Train R² (all data) : 1.000000
+
+  Note: The gap between CV R² and Train R² is expected — the train set contains
+  one row per (geohash, timestamp, day) combination, so gh_ts_mean is a perfect
+  memorisation signal on the training data. On truly unseen day-49 combinations,
+  the lag1 feature and timestamp/geohash aggregations carry the generalisation.
+
+
+================================================================================
+  DATA PREPROCESSING SUMMARY
+================================================================================
+
+  Missing values
+  ├── Temperature  : filled with global training median
+  ├── RoadType     : filled with "Unknown" → encoded as 3
+  ├── Weather      : filled with "Unknown" → encoded as 4
+  ├── LargeVehicles: NaN treated as "Not Allowed" → 0
+  └── Landmarks    : NaN treated as "No" → 0
+
+  Target encoding leakage prevention
+  └── All aggregation statistics (gh_mean, ts_mean, etc.) are computed
+      from the full training set. For the CV evaluation, only Day-48 data
+      was used as the reference to simulate a realistic test-time scenario.
+
+  Output clipping
+  └── Final predictions clipped to [0, 1] to respect the valid demand range.
+
+
+================================================================================
+  OUTPUT FILES
+================================================================================
+
+  flipkart_demand_prediction.ipynb  — Full reproducible notebook
+  submission.csv                    — Test predictions (Index, demand)
+  solution_description.txt          — This file
+
+================================================================================
